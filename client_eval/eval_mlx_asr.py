@@ -206,7 +206,8 @@ def _prepare_text_with_full_message(processor, user_message: str, num_chunks: in
     return {"input_ids": np.array([expanded], dtype=np.int32)}
 
 
-_CHUNK_SAMPLES = 30 * 16000  # 480000 samples = 30 seconds at 16kHz
+_CHUNK_SAMPLES = 30 * 16000      # 480000 samples = 30s at 16kHz
+_MIN_LAST_CHUNK = 10 * 16000     # 160000 samples = 10s — min size of last chunk
 
 
 def _infer_one_chunk(
@@ -215,7 +216,12 @@ def _infer_one_chunk(
     max_new_tokens: int,
     prompt_format: str,
 ) -> str:
-    """Run ASR inference on a single ≤30s audio chunk (no further splitting)."""
+    """Run ASR inference on an audio chunk.
+
+    Uses prepare_audio(max_duration=None) so chunks slightly longer than 30s
+    (from merging a short tail with the previous segment) are handled as
+    multi-chunk within a single inference call.
+    """
     import mlx.core as mx
     from scripts.inference import _infer_segment, build_merged_embeddings
     from meralion_mlx.processor import get_task_prompt
@@ -232,7 +238,7 @@ def _infer_one_chunk(
 
     # Old format: manually build inputs then run generation
     mel_features, num_chunks = model.processor.prepare_audio(
-        audio_array=audio_chunk, max_duration=30.0
+        audio_array=audio_chunk, max_duration=None
     )
     mel_mx = mx.array(mel_features)
     text_inputs = _prepare_text_with_full_message(
@@ -248,17 +254,17 @@ def _infer_one_chunk(
     speech_embeds = mx.concatenate(chunk_embeds, axis=1)
     mx.eval(speech_embeds)
 
-    merged = build_merged_embeddings(
+    merged_emb = build_merged_embeddings(
         model.decoder, input_ids, speech_embeds, model.processor.speech_token_index
     )
-    mx.eval(merged)
+    mx.eval(merged_emb)
 
     eos_tokens = {1, 107}
     generated = []
     for token, _ in generate_step(
         prompt=input_ids[0], model=model.decoder,
         max_tokens=max_new_tokens, sampler=None,
-        input_embeddings=merged[0],
+        input_embeddings=merged_emb[0],
     ):
         tid = int(token)
         if tid in eos_tokens:
@@ -276,21 +282,29 @@ def infer_one(
 ) -> str:
     """Run ASR inference on a single audio array.
 
-    Matches the HF eval_hf_asr.py approach: splits audio into independent
-    30s chunks, processes each separately, and concatenates outputs.
+    Strategy (matches HF eval_hf_asr.py chunking, with short-tail fix):
+    1. Split audio at 30s boundaries.
+    2. If the last chunk is shorter than 10s, merge it with the preceding
+       segment to avoid hallucinations from mostly-silent short inputs.
+    3. Process each segment independently and concatenate the outputs.
+    Merged segments >30s are handled as multi-chunk by prepare_audio internally.
 
-    prompt_format: "new" uses MERaLiON-2 default (audio then instruction);
-                   "old" uses the HF eval_hf_asr.py layout (instruction then audio).
+    prompt_format: "new" = MERaLiON-2 default; "old" = HF eval_hf_asr.py layout.
     """
     if len(audio_array) <= _CHUNK_SAMPLES:
         return _infer_one_chunk(model, audio_array, max_new_tokens, prompt_format)
 
-    # Split into 30s chunks and process independently (matches HF eval approach)
-    chunks = [
+    # Build 30s-boundary split
+    segments = [
         audio_array[start : start + _CHUNK_SAMPLES]
         for start in range(0, len(audio_array), _CHUNK_SAMPLES)
     ]
-    parts = [_infer_one_chunk(model, c, max_new_tokens, prompt_format) for c in chunks]
+
+    # Merge short last segment into the previous one to prevent hallucination
+    if len(segments) > 1 and len(segments[-1]) < _MIN_LAST_CHUNK:
+        segments = segments[:-2] + [np.concatenate([segments[-2], segments[-1]])]
+
+    parts = [_infer_one_chunk(model, seg, max_new_tokens, prompt_format) for seg in segments]
     return " ".join(p.strip() for p in parts if p.strip())
 
 
