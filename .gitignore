@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Model weights (large binary files)
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+tokenizer.model
+*.arrow
+*.lock
+
+# macOS
+.DS_Store
+
+# Secrets
+run_claude.sh
+
+# Data
+private_data/
+
+# Decoder symlink dirs (auto-generated at inference)
+models/*/decoder/
