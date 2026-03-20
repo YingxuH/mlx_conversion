@@ -206,26 +206,24 @@ def _prepare_text_with_full_message(processor, user_message: str, num_chunks: in
     return {"input_ids": np.array([expanded], dtype=np.int32)}
 
 
-def infer_one(
-    model,
-    audio_array: np.ndarray,
-    max_new_tokens: int = 512,
-    prompt_format: str = "new",
-) -> str:
-    """Run ASR inference on a single audio array.
+_CHUNK_SAMPLES = 30 * 16000  # 480000 samples = 30 seconds at 16kHz
 
-    prompt_format: "new" uses MERaLiON-2 default (audio then instruction);
-                   "old" uses the HF eval_hf_asr.py layout (instruction then audio).
-    """
+
+def _infer_one_chunk(
+    model,
+    audio_chunk: np.ndarray,
+    max_new_tokens: int,
+    prompt_format: str,
+) -> str:
+    """Run ASR inference on a single ≤30s audio chunk (no further splitting)."""
     import mlx.core as mx
     from scripts.inference import _infer_segment, build_merged_embeddings
     from meralion_mlx.processor import get_task_prompt
     from mlx_lm.generate import generate_step
 
     if prompt_format == "new":
-        # Standard path through _infer_segment
         return _infer_segment(
-            model, audio_array,
+            model, audio_chunk,
             get_task_prompt("asr"),
             max_new_tokens=max_new_tokens,
             temperature=0.0,
@@ -234,7 +232,7 @@ def infer_one(
 
     # Old format: manually build inputs then run generation
     mel_features, num_chunks = model.processor.prepare_audio(
-        audio_array=audio_array, max_duration=None
+        audio_array=audio_chunk, max_duration=30.0
     )
     mel_mx = mx.array(mel_features)
     text_inputs = _prepare_text_with_full_message(
@@ -268,6 +266,32 @@ def infer_one(
         generated.append(tid)
 
     return model.processor.decode(generated)
+
+
+def infer_one(
+    model,
+    audio_array: np.ndarray,
+    max_new_tokens: int = 512,
+    prompt_format: str = "new",
+) -> str:
+    """Run ASR inference on a single audio array.
+
+    Matches the HF eval_hf_asr.py approach: splits audio into independent
+    30s chunks, processes each separately, and concatenates outputs.
+
+    prompt_format: "new" uses MERaLiON-2 default (audio then instruction);
+                   "old" uses the HF eval_hf_asr.py layout (instruction then audio).
+    """
+    if len(audio_array) <= _CHUNK_SAMPLES:
+        return _infer_one_chunk(model, audio_array, max_new_tokens, prompt_format)
+
+    # Split into 30s chunks and process independently (matches HF eval approach)
+    chunks = [
+        audio_array[start : start + _CHUNK_SAMPLES]
+        for start in range(0, len(audio_array), _CHUNK_SAMPLES)
+    ]
+    parts = [_infer_one_chunk(model, c, max_new_tokens, prompt_format) for c in chunks]
+    return " ".join(p.strip() for p in parts if p.strip())
 
 
 # ---------------------------------------------------------------------------
