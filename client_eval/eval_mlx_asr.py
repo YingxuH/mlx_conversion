@@ -81,8 +81,9 @@ _DATASET_PATH_OVERRIDES = {
 
 # Default model dirs relative to repo root
 _DEFAULT_MODEL_DIRS = {
-    "10b": "meralion-mlx-2-10b/models/2-10b-mlx",
-    "3b":  "meralion-mlx-2-3b/models/2-3b-mlx",
+    "10b":      "meralion-mlx-2-10b/models/2-10b-mlx",
+    "10b-4bit": "meralion-mlx-2-10b/models/2-10b-mlx-4bit",
+    "3b":       "meralion-mlx-2-3b/models/2-3b-mlx",
 }
 
 # ---------------------------------------------------------------------------
@@ -175,21 +176,98 @@ def load_mlx_model(model_dir: Path, package_dir: Path):
     return model
 
 
-def infer_one(model, audio_array: np.ndarray, max_new_tokens: int = 512) -> str:
-    """Run ASR inference on a single audio array (any length ≤ 300s)."""
-    from scripts.inference import _infer_segment, get_task_prompt
-    # get_task_prompt is actually in processor.py, imported via inference.py's namespace
-    # Use the processor's get_task_prompt
-    from meralion_mlx.processor import get_task_prompt
-    instruction = get_task_prompt("asr")
-    return _infer_segment(
-        model,
-        audio_array,
-        instruction,
-        max_new_tokens=max_new_tokens,
-        temperature=0.0,
-        verbose=False,
+# Prompt formats for ASR
+# "new" = MERaLiON-2 default: audio context before instruction
+# "old" = HF eval_hf_asr.py default: instruction before audio
+_OLD_ASR_USER_MSG = (
+    "Instruction: Please transcribe this speech. \n"
+    "Follow the text instruction based on the following audio: <SpeechHere>"
+)
+
+
+def _prepare_text_with_full_message(processor, user_message: str, num_chunks: int) -> dict:
+    """Build input_ids for a custom user_message containing <SpeechHere> already."""
+    from meralion_mlx.processor import SPEECH_TOKEN_INDEX
+    conversation = [{"role": "user", "content": user_message}]
+    chat_text = processor.tokenizer.apply_chat_template(
+        conversation=[conversation], tokenize=False, add_generation_prompt=True
     )
+    if isinstance(chat_text, list):
+        chat_text = chat_text[0]
+    encoded = processor.tokenizer(chat_text, return_tensors="np")
+    input_ids = encoded["input_ids"][0]
+    total_speech = processor.fixed_speech_length * num_chunks
+    expanded = []
+    for tok in input_ids:
+        if int(tok) == SPEECH_TOKEN_INDEX:
+            expanded.extend([SPEECH_TOKEN_INDEX] * total_speech)
+        else:
+            expanded.append(int(tok))
+    return {"input_ids": np.array([expanded], dtype=np.int32)}
+
+
+def infer_one(
+    model,
+    audio_array: np.ndarray,
+    max_new_tokens: int = 512,
+    prompt_format: str = "new",
+) -> str:
+    """Run ASR inference on a single audio array.
+
+    prompt_format: "new" uses MERaLiON-2 default (audio then instruction);
+                   "old" uses the HF eval_hf_asr.py layout (instruction then audio).
+    """
+    import mlx.core as mx
+    from scripts.inference import _infer_segment, build_merged_embeddings
+    from meralion_mlx.processor import get_task_prompt
+    from mlx_lm.generate import generate_step
+
+    if prompt_format == "new":
+        # Standard path through _infer_segment
+        return _infer_segment(
+            model, audio_array,
+            get_task_prompt("asr"),
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            verbose=False,
+        )
+
+    # Old format: manually build inputs then run generation
+    mel_features, num_chunks = model.processor.prepare_audio(
+        audio_array=audio_array, max_duration=None
+    )
+    mel_mx = mx.array(mel_features)
+    text_inputs = _prepare_text_with_full_message(
+        model.processor, _OLD_ASR_USER_MSG, num_chunks
+    )
+    input_ids = mx.array(text_inputs["input_ids"])
+
+    chunk_embeds = []
+    for i in range(num_chunks):
+        enc_out = model.encoder(mel_mx[i:i+1])
+        enc_out = model.ln_speech(enc_out)
+        chunk_embeds.append(model.adaptor(enc_out))
+    speech_embeds = mx.concatenate(chunk_embeds, axis=1)
+    mx.eval(speech_embeds)
+
+    merged = build_merged_embeddings(
+        model.decoder, input_ids, speech_embeds, model.processor.speech_token_index
+    )
+    mx.eval(merged)
+
+    eos_tokens = {1, 107}
+    generated = []
+    for token, _ in generate_step(
+        prompt=input_ids[0], model=model.decoder,
+        max_tokens=max_new_tokens, sampler=None,
+        input_embeddings=merged[0],
+    ):
+        tid = int(token)
+        if tid in eos_tokens:
+            break
+        generated.append(tid)
+
+    return model.processor.decode(generated)
 
 
 # ---------------------------------------------------------------------------
@@ -198,25 +276,30 @@ def infer_one(model, audio_array: np.ndarray, max_new_tokens: int = 512) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="MLX ASR WER evaluation (Apple Silicon)")
-    parser.add_argument("--model-size", choices=["10b", "3b"], default="10b",
-                        help="Which MLX model to use (default: 10b)")
+    parser.add_argument("--model-size", choices=["10b", "10b-4bit", "3b"], default="10b-4bit",
+                        help="Which MLX model to use (default: 10b-4bit)")
     parser.add_argument("--model-dir", type=Path, default=None,
                         help="Override model dir (takes precedence over --model-size)")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_PRIVATE_DATA_ROOT)
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--max-samples", type=int, default=0, help="0 = all samples")
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--prompt-format", choices=["new", "old"], default="old",
+                        help="Prompt format: 'new' = MLX default (audio then instruction); "
+                             "'old' = HF eval layout (instruction then audio). Default: old")
     args = parser.parse_args()
 
     # Resolve model dir and package dir
     if args.model_dir is not None:
         model_dir = args.model_dir
-        # Infer package dir from model_dir location
-        package_dir = model_dir.parent.parent  # models/X-mlx -> package root
+        # Infer package dir from model_dir location (models/X-mlx -> package root)
+        package_dir = model_dir.parent.parent
     else:
         rel_path = _DEFAULT_MODEL_DIRS[args.model_size]
         model_dir = REPO_ROOT / rel_path
-        package_dir = REPO_ROOT / f"meralion-mlx-2-{args.model_size}"
+        # package dir is always the versioned package (strip -4bit suffix for dir name)
+        pkg_name = args.model_size.replace("-4bit", "")
+        package_dir = REPO_ROOT / f"meralion-mlx-2-{pkg_name}"
 
     if not model_dir.exists():
         print(f"Error: model dir not found: {model_dir}")
@@ -254,7 +337,8 @@ def main():
 
         for i, sample in enumerate(data):
             audio_arr, ref = _extract_audio_and_reference(sample)
-            pred = infer_one(model, audio_arr, max_new_tokens=args.max_new_tokens)
+            pred = infer_one(model, audio_arr, max_new_tokens=args.max_new_tokens,
+                             prompt_format=args.prompt_format)
             predictions.append(pred)
             references.append(ref)
 
@@ -282,6 +366,7 @@ def main():
         print(f"{name:<30} {r['n']:>5} {r['wer']:>8.4f} {r['threshold']:>8.2f} {r['status']:>6}")
     print("=" * 65)
     print(f"Model: {model_dir}")
+    print(f"Prompt format: {args.prompt_format}")
     print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
 
     sys.exit(0 if all_pass else 1)
