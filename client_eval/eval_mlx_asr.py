@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -55,6 +56,7 @@ DEFAULT_DATASETS = [
     "idpc_short_ASR_v2",
     "ytb_asr_batch1",
     "ytb_asr_batch2",
+    "ytb_asr_batch3_chinese",
     "ytb_asr_batch3_malay",
     "ytb_asr_batch3_tamil_v2",
 ]
@@ -63,6 +65,7 @@ DEFAULT_DATASETS_WER = {
     "idpc_short_ASR_v2": 0.16,
     "ytb_asr_batch1":    0.11,
     "ytb_asr_batch2":    0.12,
+    "ytb_asr_batch3_chinese":   0.22,
     "ytb_asr_batch3_malay":     0.22,
     "ytb_asr_batch3_tamil_v2":  0.50,
 }
@@ -71,6 +74,7 @@ _DATASET_NORMALIZER = {
     "idpc_short_ASR_v2":        preprocess_text_asr,
     "ytb_asr_batch1":           preprocess_text_asr,
     "ytb_asr_batch2":           preprocess_text_asr,
+    "ytb_asr_batch3_chinese":   preprocess_text_asr_code_switch_chinese,
     "ytb_asr_batch3_malay":     preprocess_text_asr_malay,
     "ytb_asr_batch3_tamil_v2":  preprocess_text_asr_tamil,
 }
@@ -83,6 +87,7 @@ _DATASET_PATH_OVERRIDES = {
 _DEFAULT_MODEL_DIRS = {
     "10b":      "meralion-mlx-2-10b/models/2-10b-mlx",
     "10b-4bit": "meralion-mlx-2-10b/models/2-10b-mlx-4bit",
+    "10b-8bit": "meralion-mlx-2-10b/models/2-10b-mlx-8bit",
     "3b":       "meralion-mlx-2-3b/models/2-3b-mlx",
 }
 
@@ -176,45 +181,66 @@ def load_mlx_model(model_dir: Path, package_dir: Path):
     return model
 
 
-# Prompt formats for ASR
-# "new" = MERaLiON-2 default: audio context before instruction
-# "old" = HF eval_hf_asr.py default: instruction before audio
-_OLD_ASR_USER_MSG = (
-    "Instruction: Please transcribe this speech. \n"
-    "Follow the text instruction based on the following audio: <SpeechHere>"
-)
-
-
-def _prepare_text_with_full_message(processor, user_message: str, num_chunks: int) -> dict:
-    """Build input_ids for a custom user_message containing <SpeechHere> already."""
-    from meralion_mlx.processor import SPEECH_TOKEN_INDEX
-    conversation = [{"role": "user", "content": user_message}]
-    chat_text = processor.tokenizer.apply_chat_template(
-        conversation=[conversation], tokenize=False, add_generation_prompt=True
-    )
-    if isinstance(chat_text, list):
-        chat_text = chat_text[0]
-    encoded = processor.tokenizer(chat_text, return_tensors="np")
-    input_ids = encoded["input_ids"][0]
-    total_speech = processor.fixed_speech_length * num_chunks
-    expanded = []
-    for tok in input_ids:
-        if int(tok) == SPEECH_TOKEN_INDEX:
-            expanded.extend([SPEECH_TOKEN_INDEX] * total_speech)
-        else:
-            expanded.append(int(tok))
-    return {"input_ids": np.array([expanded], dtype=np.int32)}
-
-
 _CHUNK_SAMPLES = 30 * 16000      # 480000 samples = 30s at 16kHz
 _MIN_LAST_CHUNK = 10 * 16000     # 160000 samples = 10s — min size of last chunk
+_NO_REPEAT_NGRAM_SIZE = 6        # Match generation_config.json
+
+
+def _make_no_repeat_ngram_sampler(ngram_size: int):
+    """Create a greedy sampler that blocks repeated n-grams.
+
+    Instead of modifying logits (which breaks MLX's async GPU pipeline),
+    this sampler does greedy argmax and falls back to the next-best token
+    if the top choice would create a repeated n-gram.
+
+    Returns a sampler compatible with mlx-lm's generate_step(sampler=...).
+    """
+    import mlx.core as mx
+
+    # Map (ngram_size-1) prefix -> set of tokens that followed
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    id_list: list[int] = []
+
+    def _register(token: int):
+        id_list.append(token)
+        if len(id_list) >= ngram_size:
+            prefix = tuple(id_list[-ngram_size:-1])
+            if prefix not in prefix_to_next:
+                prefix_to_next[prefix] = set()
+            prefix_to_next[prefix].add(id_list[-1])
+
+    def sampler(logits: mx.array) -> mx.array:
+        # Greedy: get top token
+        flat = logits.reshape(-1) if logits.ndim == 2 else logits
+
+        token = mx.argmax(flat)
+        tid = int(token)
+
+        # Check if this token creates a banned ngram
+        if len(id_list) >= ngram_size - 1:
+            ctx = tuple(id_list[-(ngram_size - 1):])
+            banned = prefix_to_next.get(ctx)
+            if banned and tid in banned:
+                # Top token is banned — find next best that isn't banned
+                sorted_ids = mx.argsort(flat)[::-1]
+                for candidate in sorted_ids:
+                    cid = int(candidate)
+                    if cid not in banned:
+                        tid = cid
+                        token = candidate
+                        break
+
+        _register(tid)
+        # Return shape expected by generate_step
+        return token.reshape(logits.shape[:-1]) if logits.ndim == 2 else token
+
+    return sampler
 
 
 def _infer_one_chunk(
     model,
     audio_chunk: np.ndarray,
     max_new_tokens: int,
-    prompt_format: str,
 ) -> str:
     """Run ASR inference on an audio chunk.
 
@@ -223,26 +249,16 @@ def _infer_one_chunk(
     multi-chunk within a single inference call.
     """
     import mlx.core as mx
-    from scripts.inference import _infer_segment, build_merged_embeddings
+    from scripts.inference import build_merged_embeddings
     from meralion_mlx.processor import get_task_prompt
     from mlx_lm.generate import generate_step
 
-    if prompt_format == "new":
-        return _infer_segment(
-            model, audio_chunk,
-            get_task_prompt("asr"),
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            verbose=False,
-        )
-
-    # Old format: manually build inputs then run generation
     mel_features, num_chunks = model.processor.prepare_audio(
         audio_array=audio_chunk, max_duration=None
     )
     mel_mx = mx.array(mel_features)
-    text_inputs = _prepare_text_with_full_message(
-        model.processor, _OLD_ASR_USER_MSG, num_chunks
+    text_inputs = model.processor.prepare_text(
+        get_task_prompt("asr"), num_chunks=num_chunks
     )
     input_ids = mx.array(text_inputs["input_ids"])
 
@@ -261,9 +277,10 @@ def _infer_one_chunk(
 
     eos_tokens = {1, 107}
     generated = []
+    ngram_sampler = _make_no_repeat_ngram_sampler(_NO_REPEAT_NGRAM_SIZE)
     for token, _ in generate_step(
         prompt=input_ids[0], model=model.decoder,
-        max_tokens=max_new_tokens, sampler=None,
+        max_tokens=max_new_tokens, sampler=ngram_sampler,
         input_embeddings=merged_emb[0],
     ):
         tid = int(token)
@@ -278,7 +295,6 @@ def infer_one(
     model,
     audio_array: np.ndarray,
     max_new_tokens: int = 512,
-    prompt_format: str = "new",
 ) -> str:
     """Run ASR inference on a single audio array.
 
@@ -288,11 +304,9 @@ def infer_one(
        segment to avoid hallucinations from mostly-silent short inputs.
     3. Process each segment independently and concatenate the outputs.
     Merged segments >30s are handled as multi-chunk by prepare_audio internally.
-
-    prompt_format: "new" = MERaLiON-2 default; "old" = HF eval_hf_asr.py layout.
     """
     if len(audio_array) <= _CHUNK_SAMPLES:
-        return _infer_one_chunk(model, audio_array, max_new_tokens, prompt_format)
+        return _infer_one_chunk(model, audio_array, max_new_tokens)
 
     # Build 30s-boundary split
     segments = [
@@ -304,7 +318,7 @@ def infer_one(
     if len(segments) > 1 and len(segments[-1]) < _MIN_LAST_CHUNK:
         segments = segments[:-2] + [np.concatenate([segments[-2], segments[-1]])]
 
-    parts = [_infer_one_chunk(model, seg, max_new_tokens, prompt_format) for seg in segments]
+    parts = [_infer_one_chunk(model, seg, max_new_tokens) for seg in segments]
     return " ".join(p.strip() for p in parts if p.strip())
 
 
@@ -314,7 +328,8 @@ def infer_one(
 
 def main():
     parser = argparse.ArgumentParser(description="MLX ASR WER evaluation (Apple Silicon)")
-    parser.add_argument("--model-size", choices=["10b", "10b-4bit", "3b"], default="10b-4bit",
+    parser.add_argument("--model-size", choices=["10b", "10b-4bit", "10b-8bit", "3b"],
+                        default="10b-4bit",
                         help="Which MLX model to use (default: 10b-4bit)")
     parser.add_argument("--model-dir", type=Path, default=None,
                         help="Override model dir (takes precedence over --model-size)")
@@ -322,9 +337,8 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--max-samples", type=int, default=0, help="0 = all samples")
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--prompt-format", choices=["new", "old"], default="old",
-                        help="Prompt format: 'new' = MLX default (audio then instruction); "
-                             "'old' = HF eval layout (instruction then audio). Default: old")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory to save per-sample JSONL outputs (one file per dataset)")
     args = parser.parse_args()
 
     # Resolve model dir and package dir
@@ -335,8 +349,8 @@ def main():
     else:
         rel_path = _DEFAULT_MODEL_DIRS[args.model_size]
         model_dir = REPO_ROOT / rel_path
-        # package dir is always the versioned package (strip -4bit suffix for dir name)
-        pkg_name = args.model_size.replace("-4bit", "")
+        # package dir is always the versioned package (strip quant suffix for dir name)
+        pkg_name = args.model_size.replace("-4bit", "").replace("-8bit", "")
         package_dir = REPO_ROOT / f"meralion-mlx-2-{pkg_name}"
 
     if not model_dir.exists():
@@ -344,6 +358,13 @@ def main():
         sys.exit(1)
 
     model = load_mlx_model(model_dir, package_dir)
+
+    # Per-sample output directory
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = REPO_ROOT / "eval_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Per-sample outputs: {output_dir}\n")
 
     results = {}
     all_pass = True
@@ -373,16 +394,49 @@ def main():
         predictions: list[str] = []
         references: list[str] = []
 
+        jsonl_path = output_dir / f"{dataset_name}.jsonl"
+        jsonl_fh = open(jsonl_path, "w")
+
         for i, sample in enumerate(data):
             audio_arr, ref = _extract_audio_and_reference(sample)
-            pred = infer_one(model, audio_arr, max_new_tokens=args.max_new_tokens,
-                             prompt_format=args.prompt_format)
+            sample_t0 = time.time()
+            pred = infer_one(model, audio_arr, max_new_tokens=args.max_new_tokens)
+            sample_time = time.time() - sample_t0
             predictions.append(pred)
             references.append(ref)
+
+            # Per-sample WER
+            normalizer = _DATASET_NORMALIZER.get(dataset_name)
+            norm_ref = normalizer(ref) if normalizer else ref.lower()
+            norm_pred = normalizer(pred) if normalizer else pred.lower()
+            ref_tokens = norm_ref.split() if norm_ref else []
+            pred_tokens = norm_pred.split() if norm_pred else []
+            sample_dist = _levenshtein_distance(ref_tokens, pred_tokens)
+            sample_wer = sample_dist / len(ref_tokens) if ref_tokens else 0.0
+
+            # Write per-sample result immediately
+            record = {
+                "idx": i,
+                "wer": round(sample_wer, 4),
+                "edit_dist": sample_dist,
+                "ref_words": len(ref_tokens),
+                "pred_words": len(pred_tokens),
+                "audio_secs": round(len(audio_arr) / 16000, 1),
+                "infer_secs": round(sample_time, 1),
+                "reference": ref,
+                "reference_normalized": norm_ref,
+                "prediction": pred,
+                "prediction_normalized": norm_pred,
+            }
+            jsonl_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            jsonl_fh.flush()
 
             if (i + 1) % 20 == 0 or (i + 1) == n:
                 elapsed = time.time() - t0
                 print(f"  [{i + 1}/{n}] {elapsed:.0f}s elapsed")
+
+        jsonl_fh.close()
+        print(f"  Saved: {jsonl_path}")
 
         elapsed = time.time() - t0
         wer = _compute_dataset_wer(references, predictions, dataset_name)
@@ -404,7 +458,6 @@ def main():
         print(f"{name:<30} {r['n']:>5} {r['wer']:>8.4f} {r['threshold']:>8.2f} {r['status']:>6}")
     print("=" * 65)
     print(f"Model: {model_dir}")
-    print(f"Prompt format: {args.prompt_format}")
     print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
 
     sys.exit(0 if all_pass else 1)

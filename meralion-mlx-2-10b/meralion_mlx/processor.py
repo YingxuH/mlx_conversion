@@ -195,9 +195,9 @@ class MERaLiONProcessor:
     ) -> dict:
         """Format text prompt with speech token expansion.
 
-        The MERaLiON prompt format:
-            "Given the following audio context: <SpeechHere>\n\n
-             Text instruction: {instruction}"
+        The MERaLiON prompt format (matches HF training):
+            "Instruction: {instruction} \\n
+             Follow the text instruction based on the following audio: <SpeechHere>"
 
         The <SpeechHere> token gets expanded to `fixed_speech_length * num_chunks`
         (100 per chunk) copies of speech_token_index (255999).
@@ -210,8 +210,8 @@ class MERaLiONProcessor:
             Dict with 'input_ids' and 'attention_mask' as numpy arrays
         """
         prompt = (
-            f"Given the following audio context: {SPEECH_TOKEN}\n\n"
-            f"Text instruction: {instruction}"
+            f"Instruction: {instruction} \n"
+            f"Follow the text instruction based on the following audio: {SPEECH_TOKEN}"
         )
 
         conversation = [{"role": "user", "content": prompt}]
