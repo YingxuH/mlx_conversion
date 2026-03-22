@@ -25,3 +25,7 @@ private_data/
 
 # Decoder symlink dirs (auto-generated at inference)
 models/*/decoder/
+
+# Local
+.claude/
+example_25s.wav
