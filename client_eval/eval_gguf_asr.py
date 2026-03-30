@@ -119,54 +119,69 @@ _CHUNK_SAMPLES = 30 * 16000      # 480000 samples = 30s at 16kHz
 _MIN_LAST_CHUNK = 10 * 16000     # 160000 samples = 10s — min size of last chunk
 
 
-def _infer_chunk_gguf(
-    decoder_path: Path,
-    mmproj_path: Path,
-    audio_chunk: np.ndarray,
-    max_tokens: int = 512,
-    ngl: int = 99,
-) -> str:
-    """Run inference on a single audio chunk via llama-mtmd-cli."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, audio_chunk, 16000)
-        wav_path = f.name
+def _make_chunk_payload(audio_chunk: np.ndarray, max_tokens: int = 512) -> dict:
+    """Build the HTTP request payload for a single audio chunk."""
+    import base64
+    import io
 
+    buf = io.BytesIO()
+    sf.write(buf, audio_chunk, 16000, format="WAV")
+    audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_b64,
+                            "format": "wav",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": PROMPT_TEMPLATE.replace("<__media__>", ""),
+                    },
+                ],
+            }
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "dry_multiplier": 1.0,
+        "dry_allowed_length": 1,
+    }
+
+
+def _send_request(server_url: str, payload: dict) -> str:
+    """Send a single inference request to the server."""
+    import requests
     try:
-        result = subprocess.run(
-            [
-                str(MTMD_CLI),
-                "-m", str(decoder_path),
-                "--mmproj", str(mmproj_path),
-                "--audio", wav_path,
-                "-p", PROMPT_TEMPLATE,
-                "-ngl", str(ngl),
-                "-n", str(max_tokens),
-                "--no-warmup",
-                "--no-perf",
-                # DRY sampling to prevent n-gram repetition
-                "--dry-multiplier", "1.0",
-                "--dry-allowed-length", "1",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600,
+        resp = requests.post(
+            f"{server_url}/v1/chat/completions",
+            json=payload,
+            timeout=300,
         )
-
-        lines = result.stdout.strip().split("\n")
-        text_lines = []
-        for line in lines:
-            if any(line.startswith(p) for p in [
-                "WARN:", "LOG:", "main:", "llama_", "ggml_", "clip_",
-                "load_", "warmup:", "encoding", "decoding", "audio",
-            ]):
-                continue
-            text_lines.append(line)
-
-        return "\n".join(text_lines).strip()
-    except subprocess.TimeoutExpired:
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"    Server error: {e}")
         return ""
-    finally:
-        Path(wav_path).unlink(missing_ok=True)
+
+
+def _split_audio(audio_array: np.ndarray) -> list[np.ndarray]:
+    """Split audio into 30s chunks with short-tail merge."""
+    if len(audio_array) <= _CHUNK_SAMPLES:
+        return [audio_array]
+
+    segments = [
+        audio_array[start : start + _CHUNK_SAMPLES]
+        for start in range(0, len(audio_array), _CHUNK_SAMPLES)
+    ]
+    if len(segments) > 1 and len(segments[-1]) < _MIN_LAST_CHUNK:
+        segments = segments[:-2] + [np.concatenate([segments[-2], segments[-1]])]
+    return segments
 
 
 def infer_one_gguf(
@@ -175,35 +190,34 @@ def infer_one_gguf(
     audio_array: np.ndarray,
     max_tokens: int = 512,
     ngl: int = 99,
+    server_url: str = "http://localhost:8090",
 ) -> str:
-    """Run ASR inference with smart chunking (matching MLX/HF eval strategy).
+    """Run ASR inference with smart chunking via llama-server.
 
-    Strategy:
-    1. Audio ≤30s: single chunk
-    2. Audio >30s: split at 30s boundaries, merge last if <10s,
-       process each independently, concatenate text
+    Sends all chunks of a single sample concurrently to exploit
+    the server's parallel slots (n_parallel=4).
     """
-    if len(audio_array) <= _CHUNK_SAMPLES:
-        return _infer_chunk_gguf(decoder_path, mmproj_path, audio_array, max_tokens, ngl)
+    segments = _split_audio(audio_array)
+    payloads = [_make_chunk_payload(seg, max_tokens) for seg in segments]
 
-    # Split at 30s boundaries
-    segments = [
-        audio_array[start : start + _CHUNK_SAMPLES]
-        for start in range(0, len(audio_array), _CHUNK_SAMPLES)
-    ]
-
-    # Merge short last segment into previous to prevent hallucination
-    if len(segments) > 1 and len(segments[-1]) < _MIN_LAST_CHUNK:
-        segments = segments[:-2] + [np.concatenate([segments[-2], segments[-1]])]
-
-    parts = [_infer_chunk_gguf(decoder_path, mmproj_path, seg, max_tokens, ngl) for seg in segments]
-    return " ".join(p.strip() for p in parts if p.strip())
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = [None] * len(payloads)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_to_idx = {
+            pool.submit(_send_request, server_url, p): i
+            for i, p in enumerate(payloads)
+        }
+        for future in as_completed(future_to_idx):
+            results[future_to_idx[future]] = future.result()
+    return " ".join(r.strip() for r in results if r and r.strip())
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GGUF ASR WER evaluation via llama.cpp")
-    parser.add_argument("--decoder", type=Path, required=True, help="Path to decoder GGUF")
-    parser.add_argument("--mmproj", type=Path, required=True, help="Path to mmproj GGUF")
+    parser = argparse.ArgumentParser(description="GGUF ASR WER evaluation via llama.cpp server")
+    parser.add_argument("--server-url", default="http://localhost:8090",
+                        help="URL of running llama-server (default: http://localhost:8090)")
+    parser.add_argument("--decoder", type=Path, default=None, help="(unused with server mode)")
+    parser.add_argument("--mmproj", type=Path, default=None, help="(unused with server mode)")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_PRIVATE_DATA_ROOT)
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--max-samples", type=int, default=0, help="0 = all samples")
@@ -254,6 +268,7 @@ def main():
             pred = infer_one_gguf(
                 args.decoder, args.mmproj, audio_arr,
                 max_tokens=args.max_tokens,
+                server_url=args.server_url,
             )
             sample_time = time.time() - sample_t0
             predictions.append(pred)

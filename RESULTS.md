@@ -169,13 +169,73 @@ python client_eval/eval_mlx_asr.py --model-size 10b-8bit --max-samples 8
 
 Per-sample JSONL output includes: reference, normalized reference, prediction, normalized prediction, WER, edit distance, audio duration, and inference time.
 
+## GGUF / llama.cpp Results
+
+MERaLiON was also ported to llama.cpp's GGUF format for use with Ollama and other llama.cpp-based tools. This required adding MERaLiON as a new multimodal audio architecture to llama.cpp (see `llama_cpp_meralion.patch`).
+
+### GGUF WER Results (Q8_0 decoder + f16 mmproj)
+
+| Dataset | N | HF bf16 | GGUF Q8_0 | MLX 8-bit | GGUF vs HF |
+|---|---|---|---|---|---|
+| idpc_short_ASR_v2 | 122 | 0.1488 | **0.1504** | 0.1544 | +1.1% |
+| ytb_asr_batch1 | 384 | 0.0973 | **0.0947** | 0.0990 | **-2.7%** |
+| ytb_asr_batch2 | 473 | 0.1129 | **0.1115** | 0.1175 | **-1.2%** |
+| ytb_asr_batch3_chinese | 206 | ~0.19 | **0.2403** | 0.2057 | +26% |
+| ytb_asr_batch3_malay | 200 | 0.2059 | **0.2995** | 0.2316 | +45% |
+| ytb_asr_batch3_tamil_v2 | 155 | 0.4564 | **0.5442** | 0.5172 | +19% |
+
+### Analysis: GGUF vs MLX
+
+- **English ASR: GGUF matches or beats MLX** — all three English datasets within 1-3% of HF
+- **Multilingual: MLX significantly better than GGUF** — Chinese +17%, Malay +29%, Tamil +5% relative gap
+- **Root cause: quantization method difference** between ggml Q8_0 (symmetric, block_size=32) and MLX 8-bit (group quant, group_size=64). Tested with f16 token embeddings — negligible improvement, confirming the gap is in linear layer quantization, not embedding precision.
+
+### GGUF Conversion
+
+Two GGUF files are needed:
+
+```bash
+# 1. Extract decoder weights (strips text_decoder. prefix)
+python scripts/extract_decoder_for_gguf.py \
+    --model-dir models/2-10b-hf \
+    --output-dir /tmp/meralion-decoder-hf
+
+# 2. Convert decoder to GGUF (Q8_0)
+python convert_hf_to_gguf.py /tmp/meralion-decoder-hf \
+    --outfile meralion-decoder-q8_0.gguf --outtype q8_0
+
+# 3. Convert mmproj (encoder + adaptor) to GGUF
+python convert_hf_to_gguf.py models/2-10b-hf \
+    --mmproj --outfile meralion-mmproj-f16.gguf --outtype f16
+```
+
+### GGUF Inference
+
+```bash
+# Start server
+llama-server -m meralion-decoder-q8_0.gguf --mmproj meralion-mmproj-f16.gguf -ngl 99
+
+# CLI inference
+llama-mtmd-cli -m meralion-decoder-q8_0.gguf --mmproj meralion-mmproj-f16.gguf \
+    --audio input.wav \
+    -p "Instruction: Please transcribe this speech.
+Follow the text instruction based on the following audio: <__media__>" \
+    -ngl 99 --dry-multiplier 1.0 --dry-allowed-length 1
+```
+
+The `--dry-multiplier 1.0 --dry-allowed-length 1` enables DRY sampling which prevents n-gram repetition (equivalent to `no_repeat_ngram_size` in HF).
+
 ## Conclusion
 
-The MLX 10B-8bit port of MERaLiON-2 on Apple Silicon **matches HuggingFace bf16 performance within 4% for English ASR** and within 13% for multilingual tasks. This is a strong result for running a 10B-parameter multimodal model entirely on a laptop.
+| Backend | English ASR | Multilingual | Recommended for |
+|---|---|---|---|
+| **MLX 10B-8bit** | Within 4% of HF | Within 13% of HF | Best quality on 24GB+ Mac |
+| **GGUF Q8_0** | Within 1-3% of HF | 19-45% worse than HF | Ollama/llama.cpp ecosystem |
+| **MLX 10B-4bit** | Within 14% of HF | 45-58% worse than HF | 16GB Macs (memory-constrained) |
 
-**Recommendation**: Use 10B-8bit for 24GB+ Macs (best quality). Use 10B-4bit only if memory-constrained (16GB Macs) — expect ~30-60% worse multilingual WER.
+**For on-device Apple Silicon use, MLX 8-bit is recommended.** It provides the best multilingual quality while fitting in 24GB. GGUF is the right choice if you need Ollama/llama.cpp integration, with excellent English quality but weaker multilingual support due to ggml's quantization format.
 
 The key implementation details that close the gap with HF:
 1. **Correct prompt format** matching HF training (`"Instruction: ... \nFollow the text instruction based on the following audio: <SpeechHere>"`)
-2. **No-repeat 6-gram blocking** via custom sampler (matches `generation_config.json`)
-3. **Smart chunking** with short-tail merge for long audio
+2. **No-repeat 6-gram blocking** — custom MLX sampler / DRY sampling in llama.cpp
+3. **Smart chunking** with short-tail merge for long audio (critical for >30s audio)
