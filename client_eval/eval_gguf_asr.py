@@ -115,17 +115,20 @@ def _extract_audio_and_reference(sample: dict) -> tuple[np.ndarray, str]:
     return arr.astype(np.float32), str(reference)
 
 
-def infer_one_gguf(
+_CHUNK_SAMPLES = 30 * 16000      # 480000 samples = 30s at 16kHz
+_MIN_LAST_CHUNK = 10 * 16000     # 160000 samples = 10s — min size of last chunk
+
+
+def _infer_chunk_gguf(
     decoder_path: Path,
     mmproj_path: Path,
-    audio_array: np.ndarray,
+    audio_chunk: np.ndarray,
     max_tokens: int = 512,
     ngl: int = 99,
 ) -> str:
-    """Run inference on a single audio sample via llama-mtmd-cli."""
-    # Write audio to temp WAV file
+    """Run inference on a single audio chunk via llama-mtmd-cli."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, audio_array, 16000)
+        sf.write(f.name, audio_chunk, 16000)
         wav_path = f.name
 
     try:
@@ -140,18 +143,18 @@ def infer_one_gguf(
                 "-n", str(max_tokens),
                 "--no-warmup",
                 "--no-perf",
+                # DRY sampling to prevent n-gram repetition
+                "--dry-multiplier", "1.0",
+                "--dry-allowed-length", "1",
             ],
             capture_output=True,
             text=True,
             timeout=600,
         )
 
-        # Parse output — llama-mtmd-cli prints generated text to stdout
-        # Filter out log lines (starting with timestamps, WARNING, etc.)
         lines = result.stdout.strip().split("\n")
         text_lines = []
         for line in lines:
-            # Skip log/info lines
             if any(line.startswith(p) for p in [
                 "WARN:", "LOG:", "main:", "llama_", "ggml_", "clip_",
                 "load_", "warmup:", "encoding", "decoding", "audio",
@@ -164,6 +167,37 @@ def infer_one_gguf(
         return ""
     finally:
         Path(wav_path).unlink(missing_ok=True)
+
+
+def infer_one_gguf(
+    decoder_path: Path,
+    mmproj_path: Path,
+    audio_array: np.ndarray,
+    max_tokens: int = 512,
+    ngl: int = 99,
+) -> str:
+    """Run ASR inference with smart chunking (matching MLX/HF eval strategy).
+
+    Strategy:
+    1. Audio ≤30s: single chunk
+    2. Audio >30s: split at 30s boundaries, merge last if <10s,
+       process each independently, concatenate text
+    """
+    if len(audio_array) <= _CHUNK_SAMPLES:
+        return _infer_chunk_gguf(decoder_path, mmproj_path, audio_array, max_tokens, ngl)
+
+    # Split at 30s boundaries
+    segments = [
+        audio_array[start : start + _CHUNK_SAMPLES]
+        for start in range(0, len(audio_array), _CHUNK_SAMPLES)
+    ]
+
+    # Merge short last segment into previous to prevent hallucination
+    if len(segments) > 1 and len(segments[-1]) < _MIN_LAST_CHUNK:
+        segments = segments[:-2] + [np.concatenate([segments[-2], segments[-1]])]
+
+    parts = [_infer_chunk_gguf(decoder_path, mmproj_path, seg, max_tokens, ngl) for seg in segments]
+    return " ".join(p.strip() for p in parts if p.strip())
 
 
 def main():
