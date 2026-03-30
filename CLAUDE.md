@@ -93,6 +93,31 @@ models/2-3b-mlx/
 
 The `scripts/inference.py::load_decoder` function creates a `models/2-3b-mlx/decoder/` subdirectory with symlinks and copies to satisfy mlx-lm's expected layout.
 
+## ASR Evaluation
+
+```bash
+# Full eval, 10B 8-bit model (recommended)
+python client_eval/eval_mlx_asr.py --model-size 10b-8bit
+
+# Quick smoke test
+python client_eval/eval_mlx_asr.py --model-size 10b-8bit --max-samples 8
+
+# Specific datasets
+python client_eval/eval_mlx_asr.py --model-size 10b-8bit --datasets ytb_asr_batch2 ytb_asr_batch3_chinese
+```
+
+Per-sample JSONL outputs are saved to `eval_outputs/`. See `RESULTS.md` for full evaluation findings.
+
+**Critical implementation notes:**
+- **Prompt format**: Must use `"Instruction: {task} \nFollow ... <SpeechHere>"` (set in `processor.py`). The old `"Given the following audio context: <SpeechHere>..."` format gives worse WER.
+- **No-repeat n-gram**: Must be implemented as a custom **sampler**, not a logits processor. Any Python-side `mx.array` manipulation in the `generate_step` hot loop (including `np.array(logits)` or `logits[idx] = val`) breaks MLX's async GPU pipeline, causing 100-1000x slowdowns.
+- **Smart chunking**: Long audio split at 30s boundaries; last segment merged into previous if <10s to prevent hallucination on mostly-silent padded chunks.
+
+## HuggingFace Model Repos
+
+- 10B 8-bit MLX: https://huggingface.co/YingxuHe/mlx_test_10b
+- 3B fp16 MLX: https://huggingface.co/YingxuHe/mlx_test_3b
+
 ## Supported Tasks
 
 | Flag | Description |
