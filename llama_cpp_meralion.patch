@@ -1,0 +1,258 @@
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index bcf98cf..d75e9ee 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -10980,6 +10980,55 @@ class UltravoxWhisperEncoderModel(WhisperEncoderModel):
+         self.gguf_writer.add_audio_stack_factor(self.global_config["stack_factor"])
+ 
+ 
++@ModelBase.register("MERaLiON2ForConditionalGeneration")
++class MERaLiONWhisperEncoderModel(WhisperEncoderModel):
++    has_vision_encoder = False
++    has_audio_encoder = True
++
++    def get_audio_config(self) -> dict[str, Any] | None:
++        return self.global_config.get("speech_config")
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MERALION)
++        # scale_factor = 15: stacks 15 frames → 1 token (1500 → 100 timesteps)
++        self.gguf_writer.add_audio_stack_factor(self.global_config.get("speech_mlp_scale_factor", 15))
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # Skip text decoder tensors
++        if name.startswith("text_decoder."):
++            return
++
++        # Map speech_encoder.* → audio_tower.*
++        if name.startswith("speech_encoder."):
++            name = name.replace("speech_encoder.", "audio_tower.")
++
++        # Map ln_speech.* → audio.multi_modal_projector.ln_pre.*
++        if name.startswith("ln_speech."):
++            name = name.replace("ln_speech.", "audio.multi_modal_projector.ln_pre.")
++
++        # Map speech_audio_adapter.* → audio.multi_modal_projector.*
++        # Use indexed linear_{bid} naming to fit A_MMPROJ tensor mapping:
++        #   linear_0 = frame compression (19200 → 6400) + SiLU
++        #   linear_1 = gate_proj (6400 → 6400) for GLU
++        #   linear_2 = pool_proj (6400 → 6400) for GLU
++        #   linear_3 = out_proj  (6400 → 3584)
++        if name.startswith("speech_audio_adapter."):
++            name = name.replace("speech_audio_adapter.", "audio.multi_modal_projector.")
++            if ".mlp_adapter.0." in name:
++                name = name.replace(".mlp_adapter.0.", ".linear_0.")
++            elif ".gate_proj." in name:
++                name = name.replace(".gate_proj.", ".linear_1.")
++            elif ".pool_proj." in name:
++                name = name.replace(".pool_proj.", ".linear_2.")
++            elif ".out_proj." in name:
++                name = name.replace(".out_proj.", ".linear_3.")
++
++        # Note: conv bias unsqueeze is handled by parent WhisperEncoderModel
++
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
+ @ModelBase.register("VoxtralForConditionalGeneration")
+ class VoxtralWhisperEncoderModel(WhisperEncoderModel):
+     has_vision_encoder = False # no vision encoder
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index b35c976..df0ecc7 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -4023,6 +4023,7 @@ class VisionProjectorType:
+     GLMA = "glma" # audio
+     QWEN25O = "qwen2.5o" # omni
+     VOXTRAL = "voxtral"
++    MERALION = "meralion"  # audio: Whisper + gated MLP adaptor
+     LFM2 = "lfm2"
+     KIMIVL = "kimivl"
+     PADDLEOCR = "paddleocr"
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index df70577..bc62008 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -1911,7 +1911,7 @@ class TensorNameMap:
+         # this prefix is added in the conversion code in modify_tensors()
+ 
+         MODEL_TENSOR.A_MMPROJ: (
+-            "audio.multi_modal_projector.linear_{bid}", # ultravox
++            "audio.multi_modal_projector.linear_{bid}", # ultravox, meralion
+             "audio_adapter.model.{bid}" # lfm2
+         ),
+ 
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index 011d76b..0053762 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -244,6 +244,7 @@ enum projector_type {
+     PROJECTOR_TYPE_GLMA,
+     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
+     PROJECTOR_TYPE_VOXTRAL,
++    PROJECTOR_TYPE_MERALION,
+     PROJECTOR_TYPE_MUSIC_FLAMINGO,
+     PROJECTOR_TYPE_LFM2,
+     PROJECTOR_TYPE_KIMIVL,
+@@ -282,6 +283,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_GLMA,      "glma"},
+     { PROJECTOR_TYPE_QWEN25O,   "qwen2.5o"},
+     { PROJECTOR_TYPE_VOXTRAL,   "voxtral"},
++    { PROJECTOR_TYPE_MERALION,  "meralion"},
+     { PROJECTOR_TYPE_MUSIC_FLAMINGO, "musicflamingo"},
+     { PROJECTOR_TYPE_LFM2,      "lfm2"},
+     { PROJECTOR_TYPE_KIMIVL,    "kimivl"},
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index a73e9ba..6e65d38 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -445,7 +445,8 @@ struct clip_model {
+ 
+     bool audio_has_stack_frames() const {
+         return proj_type == PROJECTOR_TYPE_ULTRAVOX
+-            || proj_type == PROJECTOR_TYPE_VOXTRAL;
++            || proj_type == PROJECTOR_TYPE_VOXTRAL
++            || proj_type == PROJECTOR_TYPE_MERALION;
+     }
+ };
+ 
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 2947fcf..8b64096 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -842,6 +842,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
+         case PROJECTOR_TYPE_VOXTRAL:
+         case PROJECTOR_TYPE_QWEN2A:
+         case PROJECTOR_TYPE_GLMA:
++        case PROJECTOR_TYPE_MERALION:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+             {
+                 builder = std::make_unique<clip_graph_whisper_enc>(ctx, img);
+@@ -1317,10 +1318,12 @@ struct clip_model_loader {
+                 case PROJECTOR_TYPE_QWEN2A:
+                 case PROJECTOR_TYPE_GLMA:
+                 case PROJECTOR_TYPE_VOXTRAL:
++                case PROJECTOR_TYPE_MERALION:
+                 case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+                     {
+                         bool require_stack = model.proj_type == PROJECTOR_TYPE_ULTRAVOX ||
+                                              model.proj_type == PROJECTOR_TYPE_VOXTRAL ||
++                                             model.proj_type == PROJECTOR_TYPE_MERALION ||
+                                              model.proj_type == PROJECTOR_TYPE_GLMA;
+                         get_u32(KEY_A_PROJ_STACK_FACTOR, hparams.proj_stack_factor, require_stack);
+                         hparams.ffn_op = FFN_GELU_ERF;
+@@ -1862,6 +1865,30 @@ struct clip_model_loader {
+                     model.mm_norm_pre_w = get_tensor(string_format(TN_MM_NORM_PRE, "weight"));
+                     model.mm_norm_mid_w = get_tensor(string_format(TN_MM_NORM_MID, "weight"));
+                 } break;
++            case PROJECTOR_TYPE_MERALION:
++                {
++                    // Whisper encoder conv layers
++                    model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
++                    model.conv1d_1_b = get_tensor(string_format(TN_CONV1D, 1, "bias"));
++                    model.conv1d_2_w = get_tensor(string_format(TN_CONV1D, 2, "weight"));
++                    model.conv1d_2_b = get_tensor(string_format(TN_CONV1D, 2, "bias"));
++                    // MERaLiON adaptor: 4 linear layers + ln_pre
++                    // linear_0 = frame compression (19200→6400) + SiLU
++                    // linear_1 = gate_proj (6400→6400) for GLU
++                    // linear_2 = pool_proj (6400→6400) for GLU
++                    // linear_3 = out_proj  (6400→3584)
++                    model.mm_0_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 0, "weight"));
++                    model.mm_0_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 0, "bias"));
++                    model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
++                    model.mm_1_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "bias"));
++                    model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
++                    model.mm_2_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "bias"));
++                    model.mm_3_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 3, "weight"));
++                    model.mm_3_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 3, "bias"));
++                    // ln_speech (LayerNorm before adaptor)
++                    model.mm_norm_pre_w = get_tensor(string_format(TN_MM_NORM_PRE, "weight"));
++                    model.mm_norm_pre_b = get_tensor(string_format(TN_MM_NORM_PRE, "bias"));
++                } break;
+             case PROJECTOR_TYPE_QWEN2A:
+                 {
+                     model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
+@@ -2629,6 +2656,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
+         case PROJECTOR_TYPE_VOXTRAL:
+         case PROJECTOR_TYPE_ULTRAVOX:
+         case PROJECTOR_TYPE_QWEN2A:
++        case PROJECTOR_TYPE_MERALION:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+             {
+                 n_patches = img->nx;
+@@ -3065,6 +3093,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+         case PROJECTOR_TYPE_ULTRAVOX:
+         case PROJECTOR_TYPE_LFM2:
+         case PROJECTOR_TYPE_VOXTRAL:
++        case PROJECTOR_TYPE_MERALION:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+         case PROJECTOR_TYPE_JANUS_PRO:
+         case PROJECTOR_TYPE_PHI4:
+@@ -3224,6 +3253,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+         case PROJECTOR_TYPE_VOXTRAL:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+             return ctx->model.mm_2_w->ne[1];
++        case PROJECTOR_TYPE_MERALION:
++            return ctx->model.mm_3_w->ne[1]; // out_proj output dim
+         case PROJECTOR_TYPE_INTERNVL:
+         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+             return ctx->model.mm_3_w->ne[1];
+@@ -3282,6 +3313,7 @@ bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {
+         case PROJECTOR_TYPE_QWEN2A:
+         case PROJECTOR_TYPE_GLMA:
+         case PROJECTOR_TYPE_VOXTRAL:
++        case PROJECTOR_TYPE_MERALION:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+             return true;
+         default:
+diff --git a/tools/mtmd/models/whisper-enc.cpp b/tools/mtmd/models/whisper-enc.cpp
+index ed61bb0..e6c71eb 100644
+--- a/tools/mtmd/models/whisper-enc.cpp
++++ b/tools/mtmd/models/whisper-enc.cpp
+@@ -95,6 +95,33 @@ ggml_cgraph * clip_graph_whisper_enc::build() {
+             FFN_GELU_ERF,
+             -1);
+ 
++    } else if (proj_type == PROJECTOR_TYPE_MERALION) {
++        // MERaLiON adaptor: ln_speech → reshape/stack → Linear+SiLU → GLU(gate,pool) → out_proj
++        // ln_speech (LayerNorm before adaptor)
++        cur = ggml_norm(ctx0, cur, hparams.eps);
++        cur = ggml_mul(ctx0, cur, model.mm_norm_pre_w);
++        cur = ggml_add(ctx0, cur, model.mm_norm_pre_b);
++
++        // Frame stacking is already done by build_stack above (scale_factor=15)
++        // linear_0: frame compression (19200 → 6400) + SiLU
++        cur = ggml_mul_mat(ctx0, model.mm_0_w, cur);
++        cur = ggml_add(ctx0, cur, model.mm_0_b);
++        cur = ggml_silu(ctx0, cur);
++
++        // GLU: silu(gate_proj(x)) * pool_proj(x)
++        ggml_tensor * gate = ggml_mul_mat(ctx0, model.mm_1_w, cur);
++        gate = ggml_add(ctx0, gate, model.mm_1_b);
++        gate = ggml_silu(ctx0, gate);
++
++        ggml_tensor * pool = ggml_mul_mat(ctx0, model.mm_2_w, cur);
++        pool = ggml_add(ctx0, pool, model.mm_2_b);
++
++        cur = ggml_mul(ctx0, gate, pool);
++
++        // linear_3: out_proj (6400 → 3584)
++        cur = ggml_mul_mat(ctx0, model.mm_3_w, cur);
++        cur = ggml_add(ctx0, cur, model.mm_3_b);
++
+     } else if (proj_type == PROJECTOR_TYPE_GLMA) {
+             cur = ggml_norm(ctx0, cur, hparams.eps);
+             cur = ggml_mul(ctx0, cur, model.mm_norm_pre_w);
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 9c400ce..940ec07 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -439,6 +439,7 @@ struct mtmd_context {
+                 } break;
+             case PROJECTOR_TYPE_ULTRAVOX:
+             case PROJECTOR_TYPE_GLMA:
++            case PROJECTOR_TYPE_MERALION:
+                 {
+                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                 } break;
