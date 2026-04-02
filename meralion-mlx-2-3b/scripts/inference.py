@@ -38,6 +38,100 @@ from meralion_mlx.processor import MERaLiONProcessor, get_task_prompt, load_audi
 from meralion_mlx.whisper_encoder import WhisperEncoder, WhisperEncoderConfig
 from meralion_mlx.adaptor import create_adapter
 
+# ---------------------------------------------------------------------------
+# N-gram blocking sampler
+# ---------------------------------------------------------------------------
+
+NO_REPEAT_NGRAM_SIZE = 6
+
+
+def make_no_repeat_ngram_sampler(ngram_size: int = NO_REPEAT_NGRAM_SIZE):
+    """Create a greedy sampler that blocks repeated n-grams.
+
+    Instead of modifying logits (which breaks MLX's async GPU pipeline),
+    this sampler does greedy argmax and falls back to the next-best token
+    if the top choice would create a repeated n-gram.
+
+    Returns a sampler compatible with mlx-lm's generate_step(sampler=...).
+    """
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    id_list: list[int] = []
+
+    def _register(token: int):
+        id_list.append(token)
+        if len(id_list) >= ngram_size:
+            prefix = tuple(id_list[-ngram_size:-1])
+            if prefix not in prefix_to_next:
+                prefix_to_next[prefix] = set()
+            prefix_to_next[prefix].add(id_list[-1])
+
+    def sampler(logits: mx.array) -> mx.array:
+        flat = logits.reshape(-1) if logits.ndim == 2 else logits
+
+        token = mx.argmax(flat)
+        tid = int(token)
+
+        # Check if this token creates a banned ngram
+        if len(id_list) >= ngram_size - 1:
+            ctx = tuple(id_list[-(ngram_size - 1):])
+            banned = prefix_to_next.get(ctx)
+            if banned and tid in banned:
+                sorted_ids = mx.argsort(flat)[::-1]
+                for candidate in sorted_ids:
+                    cid = int(candidate)
+                    if cid not in banned:
+                        tid = cid
+                        token = candidate
+                        break
+
+        _register(tid)
+        return token.reshape(logits.shape[:-1]) if logits.ndim == 2 else token
+
+    return sampler
+
+
+def _wrap_sampler_with_ngram_blocking(base_sampler, ngram_size: int = NO_REPEAT_NGRAM_SIZE):
+    """Wrap any sampler (including temperature>0) with n-gram blocking.
+
+    For temperature=0 (base_sampler is None), uses greedy with blocking.
+    For temperature>0, runs the base sampler then checks/rejects banned n-grams.
+    """
+    if base_sampler is None:
+        return make_no_repeat_ngram_sampler(ngram_size)
+
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    id_list: list[int] = []
+
+    def _register(token: int):
+        id_list.append(token)
+        if len(id_list) >= ngram_size:
+            prefix = tuple(id_list[-ngram_size:-1])
+            if prefix not in prefix_to_next:
+                prefix_to_next[prefix] = set()
+            prefix_to_next[prefix].add(id_list[-1])
+
+    def wrapped_sampler(logits: mx.array) -> mx.array:
+        token = base_sampler(logits)
+        tid = int(token.reshape(-1)[0]) if token.ndim > 0 else int(token)
+
+        if len(id_list) >= ngram_size - 1:
+            ctx = tuple(id_list[-(ngram_size - 1):])
+            banned = prefix_to_next.get(ctx)
+            if banned and tid in banned:
+                flat = logits.reshape(-1) if logits.ndim == 2 else logits
+                sorted_ids = mx.argsort(flat)[::-1]
+                for candidate in sorted_ids:
+                    cid = int(candidate)
+                    if cid not in banned:
+                        tid = cid
+                        token = candidate.reshape(token.shape)
+                        break
+
+        _register(tid)
+        return token
+
+    return wrapped_sampler
+
 
 def is_converted_dir(model_dir: Path) -> bool:
     """Check if model_dir contains converted MLX weights."""
@@ -400,7 +494,9 @@ def _infer_segment(
     prompt_tokens = input_ids[0]  # (S,) — 1D for generate_step
     embeddings_2d = merged_embeds[0]  # (S, H) — 2D for generate_step
 
-    sampler = make_sampler(temp=temperature) if temperature > 0 else None
+    # N-gram blocking always enabled (matches HF generation_config.json)
+    base_sampler = make_sampler(temp=temperature) if temperature > 0 else None
+    sampler = _wrap_sampler_with_ngram_blocking(base_sampler, NO_REPEAT_NGRAM_SIZE)
 
     # EOS tokens for Gemma2: <eos>=1, <end_of_turn>=107
     eos_tokens = {1, 107}

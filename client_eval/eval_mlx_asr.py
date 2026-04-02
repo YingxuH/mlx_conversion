@@ -186,57 +186,6 @@ _MIN_LAST_CHUNK = 10 * 16000     # 160000 samples = 10s — min size of last chu
 _NO_REPEAT_NGRAM_SIZE = 6        # Match generation_config.json
 
 
-def _make_no_repeat_ngram_sampler(ngram_size: int):
-    """Create a greedy sampler that blocks repeated n-grams.
-
-    Instead of modifying logits (which breaks MLX's async GPU pipeline),
-    this sampler does greedy argmax and falls back to the next-best token
-    if the top choice would create a repeated n-gram.
-
-    Returns a sampler compatible with mlx-lm's generate_step(sampler=...).
-    """
-    import mlx.core as mx
-
-    # Map (ngram_size-1) prefix -> set of tokens that followed
-    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
-    id_list: list[int] = []
-
-    def _register(token: int):
-        id_list.append(token)
-        if len(id_list) >= ngram_size:
-            prefix = tuple(id_list[-ngram_size:-1])
-            if prefix not in prefix_to_next:
-                prefix_to_next[prefix] = set()
-            prefix_to_next[prefix].add(id_list[-1])
-
-    def sampler(logits: mx.array) -> mx.array:
-        # Greedy: get top token
-        flat = logits.reshape(-1) if logits.ndim == 2 else logits
-
-        token = mx.argmax(flat)
-        tid = int(token)
-
-        # Check if this token creates a banned ngram
-        if len(id_list) >= ngram_size - 1:
-            ctx = tuple(id_list[-(ngram_size - 1):])
-            banned = prefix_to_next.get(ctx)
-            if banned and tid in banned:
-                # Top token is banned — find next best that isn't banned
-                sorted_ids = mx.argsort(flat)[::-1]
-                for candidate in sorted_ids:
-                    cid = int(candidate)
-                    if cid not in banned:
-                        tid = cid
-                        token = candidate
-                        break
-
-        _register(tid)
-        # Return shape expected by generate_step
-        return token.reshape(logits.shape[:-1]) if logits.ndim == 2 else token
-
-    return sampler
-
-
 def _infer_one_chunk(
     model,
     audio_chunk: np.ndarray,
@@ -249,7 +198,7 @@ def _infer_one_chunk(
     multi-chunk within a single inference call.
     """
     import mlx.core as mx
-    from scripts.inference import build_merged_embeddings
+    from scripts.inference import build_merged_embeddings, make_no_repeat_ngram_sampler
     from meralion_mlx.processor import get_task_prompt
     from mlx_lm.generate import generate_step
 
@@ -277,7 +226,7 @@ def _infer_one_chunk(
 
     eos_tokens = {1, 107}
     generated = []
-    ngram_sampler = _make_no_repeat_ngram_sampler(_NO_REPEAT_NGRAM_SIZE)
+    ngram_sampler = make_no_repeat_ngram_sampler(_NO_REPEAT_NGRAM_SIZE)
     for token, _ in generate_step(
         prompt=input_ids[0], model=model.decoder,
         max_tokens=max_new_tokens, sampler=ngram_sampler,
